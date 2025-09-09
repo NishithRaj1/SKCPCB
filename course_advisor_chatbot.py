@@ -10,12 +10,12 @@ from langchain.memory import ConversationBufferMemory
 
 # ------------------------- Load API Key -------------------------
 load_dotenv(dotenv_path="./.env", override=True)   
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")                 
+if not OPENAI_API_KEY: 
     raise ValueError("❌ OPENAI_API_KEY not found in .env file")
 
 # ------------------------- Vector Database (Chroma) -------------------------
-VECTOR_DB_DIR = "knowledge_vector_db"
+VECTOR_DB_DIR = "knowledge_vector_db"  
 
 embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
 
