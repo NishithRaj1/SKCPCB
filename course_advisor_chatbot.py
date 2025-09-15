@@ -1,99 +1,137 @@
+# course_advisor_chatbot.py
 import os
 from dotenv import load_dotenv
-
-# ------------------------- Updated imports -------------------------
+import uuid
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_chroma import Chroma
-from langchain.prompts import PromptTemplate
-from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferMemory
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain.chains import create_retrieval_chain
+from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 
 # ------------------------- Load API Key -------------------------
-load_dotenv(dotenv_path="./.env", override=True)   
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")                 
-if not OPENAI_API_KEY: 
-    raise ValueError("❌ OPENAI_API_KEY not found in .env file")
+load_dotenv(".env")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY not found in .env")
 
-# ------------------------- Vector Database (Chroma) -------------------------
-VECTOR_DB_DIR = "knowledge_vector_db"  
+# ------------------------- Vector DB -------------------------
+VECTOR_DB_DIR = "knowledge_vector_db"
+COLLECTION_NAME = "skillcapital_knowledge"
 
-embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
-
+embeddings = OpenAIEmbeddings(
+    openai_api_key=OPENAI_API_KEY,
+    model="text-embedding-3-small"
+)
 vector_store = Chroma(
     persist_directory=VECTOR_DB_DIR,
-    embedding_function=embeddings
+    embedding_function=embeddings,
+    collection_name=COLLECTION_NAME
 )
 
-retriever = vector_store.as_retriever(search_kwargs={"k": 5})
-
-# ------------------------- Memory for conversation -------------------------
-memory = ConversationBufferMemory(
-    memory_key="chat_history",
-    return_messages=True
+# ------------------------- Retriever -------------------------
+retriever = vector_store.as_retriever(
+    search_type="similarity",
+    search_kwargs={"k": 5}  # retrieve only top relevant chunks
 )
 
-# ------------------------- Official Prompt -------------------------
-prompt_template = """
-You are 'course_advisor', the official SkillCapital assistant.
-Always represent SkillCapital positively and highlight our unique advantages.
-Use ONLY the knowledge base retrieved below. If the answer is not in the knowledge, say "I don’t know".
+# ------------------------- Memory -------------------------
+memory_store = {}  # session_id → ConversationBufferMemory
 
-Rules:
-- If asked for a course list → provide only course titles.
-- If asked about free courses → explain 'Fundamentals of Tech' is free only with another purchase.
-- If user negotiates price → politely redirect to hello@skillcapital.ai.
-- If asked how to enroll → explain only enrollment steps (not price, not curriculum).
-- After enrollment → inform that users will receive an email with access details via LMS.
-- Always answer in clear and professional English, regardless of the user’s input language.
-- Only include hello@skillcapital.ai if the user explicitly asks for contact details.
+def get_memory(session_id: str):
+    if session_id not in memory_store:
+        memory_store[session_id] = ConversationBufferMemory(
+            memory_key="chat_history",
+            return_messages=True
+        )
+    return memory_store[session_id]
 
-Chat History:
-{chat_history}
+# ------------------------- Prompt -------------------------
+answer_prompt = ChatPromptTemplate.from_messages([
+    ("system",
+     """
+     You are the SkillCapital course assistant.
+     Answer ONLY using the retrieved knowledge. Do NOT invent anything.
+     If info is not found, respond exactly: "Please contact hello@skillcapital.ai".
 
-Relevant Knowledge (retrieved):
-{context}
+     Rules:
+     - Keep answers concise (2-4 sentences) unless more detail is explicitly requested.
+     - For course list → output all course titles found in retrieved knowledge, one course per line, numbered starting from 1.
+     - For curriculum/details → extract items under "Curriculum:" from the relevant course.
+     - For free courses → say 'Fundamentals of Tech' is free only with another purchase.
+     - For enrollment or course access:
+         - Explain naturally that after payment, LMS credentials are emailed to the student.
+         - If there are payment issues, ask to contact hello@skillcapital.ai.
+         - If there are LMS access issues, ask to contact hello@skillcapital.ai.
+         - Do NOT give step-by-step “Enroll Now” instructions.
+     - Always pick the most relevant chunk(s) for the user query.
+     - Provide clickable links in markdown wherever applicable.
+     """
+    ),
+    MessagesPlaceholder("chat_history"),
+    ("system", "Retrieved knowledge:\n{context}"),
+    ("human", "{input}")
+])
 
-User Question:
-{question}
 
-Final Answer (to user):
-"""
-
-prompt = PromptTemplate(
-    input_variables=["chat_history", "context", "question"],
-    template=prompt_template,
-)
-
-# ------------------------- LLM Setup -------------------------
+# ------------------------- LLM & RAG Chain -------------------------
 llm = ChatOpenAI(
     openai_api_key=OPENAI_API_KEY,
     model="gpt-3.5-turbo",
-    temperature=0.3
+    temperature=0.3,
+    max_tokens=250  # concise responses
 )
+qa_chain = create_stuff_documents_chain(llm=llm, prompt=answer_prompt)
+rag_chain = create_retrieval_chain(retriever, qa_chain)
 
-# ------------------------- Conversational RAG Chain -------------------------
-qa_chain = ConversationalRetrievalChain.from_llm(
-    llm=llm,
-    retriever=retriever,
-    memory=memory,
-    combine_docs_chain_kwargs={"prompt": prompt}
-)
+# ------------------------- Chat Function -------------------------
+def ask_course_bot(query: str, session_id=None):
+    if session_id is None:
+        session_id = str(uuid.uuid4())
+    memory = get_memory(session_id)
 
-# ------------------------- Function for FastAPI / CLI -------------------------
-def course_advi_rag(user_query: str) -> str:
-    result = qa_chain.invoke({"question": user_query})
-    return result["answer"]  # <-- only return the final answer string
+    try:
+        # Retrieve relevant chunks first
+        docs = retriever.get_relevant_documents(query)
+        if not docs:
+            return "Please contact hello@skillcapital.ai", session_id
 
-# ------------------------- CLI Testing -------------------------
+        # Pass previous conversation to LLM
+        chat_history = memory.load_memory_variables({})["chat_history"]
+        res = rag_chain.invoke({"input": query, "chat_history": chat_history})
+
+        # Save response to memory
+        memory.save_context(
+            {"input": query},
+            {"output": res if isinstance(res, str) else res.get("answer", "")}
+        )
+
+        # Return response
+        if isinstance(res, str):
+            answer = res
+        elif isinstance(res, dict):
+            answer = res.get("answer") or res.get("output_text") or "Please contact hello@skillcapital.ai"
+        else:
+            answer = "Please contact hello@skillcapital.ai"
+
+        return answer, session_id
+
+    except Exception as e:
+        print("Error:", e)
+        return "Please contact hello@skillcapital.ai", session_id
+
+# ------------------------- CLI -------------------------
 if __name__ == "__main__":
-    print("🤖 Course Advisor Chatbot (type 'exit' to quit)\n")
+    print("🤖 SkillCapital Course Chatbot (type 'exit' to quit)\n")
+    sess = None
     while True:
-        query = input("You: ")
-        if query.lower() in ["exit", "quit","bye"]:
+        try:
+            q = input("You: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n👋 Goodbye!")
+            break
+        if not q or q.lower() in {"exit", "quit", "bye"}:
             print("👋 Goodbye!")
             break
-        try:
-            response = course_advi_rag(query)
-            print(f"Bot: {response}\n")
-        except Exception as e:
-            print(f"⚠️ Error: {str(e)}\n")
+        ans, sess = ask_course_bot(q, sess)
+        print(f"Bot: {ans}\n")
