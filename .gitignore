@@ -1,5 +1,12 @@
 .env/
  
 
+# Python cache
+__pycache__/
+*.pyc
+
+# Chroma / vector DB
+knowledge_vector_db/
+
  .env
 .env
