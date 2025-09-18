@@ -1,0 +1,9 @@
+tiktoken
+requests
+fastapi
+uvicorn
+python-dotenv
+langchain
+chromadb
+openai
+pydantic
