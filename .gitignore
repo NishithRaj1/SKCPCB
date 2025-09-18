@@ -3,4 +3,4 @@ venv/
 knowledge_vector_db/
  
 
- 
+ .env
